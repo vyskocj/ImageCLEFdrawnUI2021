@@ -19,16 +19,22 @@ CONFIG = {
         os.path.dirname(__file__), "..", "data", "screenshot_development_set", "validation", "val_set.json"
     ),
     "screenshot_train_data": os.path.join(
-        os.path.dirname(__file__), "..", "data", "screenshot_development_set", "training", "images"
+        os.path.dirname(__file__), "..", "data", "screenshot_development_set", "train", "images"
     ),
     "screenshot_train_json": os.path.join(
-        os.path.dirname(__file__), "..", "data", "screenshot_development_set", "training", "train_set.json"
+        os.path.dirname(__file__), "..", "data", "screenshot_development_set", "train", "train_set.json"
+    ),
+    "screenshot_eval_data": os.path.join(
+        os.path.dirname(__file__), "..", "data", "screenshot_test_set", "test", "images"
     ),
     "wireframe_data": os.path.join(
         os.path.dirname(__file__), "..", "data", "wireframe_development_set", "images"
     ),
     "wireframe_json": os.path.join(
         os.path.dirname(__file__), "..", "data", "wireframe_development_set", "development_set.json"
+    ),
+    "wireframe_eval_data": os.path.join(
+        os.path.dirname(__file__), "..", "data", "wireframe_test_set", "test"
     ),
     "output_path": os.path.join(
         os.path.dirname(__file__), "..", "__OUTPUT__"
@@ -47,6 +53,10 @@ def decode_bbox(box, img_width, img_height):
     # coco format defines [x, y, width, height]
     return box[1] * img_width, box[0] * img_height, box[3] * img_width, box[2] * img_height
 
+
+def encode_bbox(box, img_width, img_height):
+    # drawnUI challenge format defines [y, x, height, width] as relative
+    return box[1] / img_height, box[0] / img_width, box[3] / img_height, box[2] / img_width
 
 
 def vis_data(json_path, data_path, show=False, save=True, set_name="data"):
@@ -287,6 +297,56 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
                             f"'reproducibility'], actual is '{split}'")
 
     return coco_list
+
+
+def make_coco_eval(set_name, data_path, coco_categories):
+    # initialization of coco dictionary
+    coco = {
+       "info": {
+           "description": "COCO drawnUI2021 dataset",
+            "version": "1.0",
+            "year": 2021,
+            "date_created": "2021/02/12"
+       },
+       "licenses": [],
+       "images": [],
+       "annotations": [],
+       "categories": []
+    }
+
+    # list images
+    for img_id, filename in enumerate(os.listdir(data_path), start=1):
+        # check the image size
+        with Image.open(os.path.join(data_path, filename)) as img:
+            width, height = img.size
+
+        # append image info
+        coco["images"].append(
+            {
+                "id": img_id,
+                "file_name": filename,
+                "width": width,
+                "height": height
+            }
+        )
+
+    # sort categories by id and store them in the coco dictionary
+    coco["categories"] = coco_categories
+
+    # save data, if required
+    output_path = ""
+    if set_name is not None:
+        output_path = os.path.join(CONFIG["output_path"], "make_coco")
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
+        output_path = os.path.join(output_path, f"coco_{set_name}.json")
+        with open(output_path, "w") as coco_file:
+            json.dump(coco, coco_file)
+            print(f"COCO evaluation file saved: {output_path}")
+            print("")
+
+    return coco, output_path
 
 
 def copy_data(coco_data, data_path, set_name):
@@ -610,56 +670,45 @@ def vis_stats(stats_data, set_name=None, show=False, save=True):
         output_file.close()
 
 
-def make_submission_file(eval_json, coco_data, confidence=.9, empty_class=-1):
-    WIDTH, HEIGHT = 1, 0
+def make_submission_file(eval_json, coco_data, output_dir=""):
     submit = list()
-
-    with open(eval_json) as json_file:
+    with open(eval_json, "r") as json_file:
         eval = json.load(json_file)
 
         # get dicts by id
         coco_imgs = dict()
         for img in coco_data["images"]:
-            coco_imgs[str(img["id"])] = img["file_name"]
+            coco_imgs[int(img["id"])] = [img["file_name"], img["width"], img["height"]]
+        FILE_NAME, WIDTH, HEIGHT = 0, 1, 2
 
         coco_cats = dict()
         for cat in coco_data["categories"]:
-            coco_cats[cat["id"]] = cat["name"]
-        max_cat_id = max(list(coco_cats.keys()))
+            coco_cats[int(cat["id"])] = cat["name"]
 
         # prepare submission file
-        querry_list = range(len(eval[list(eval.keys())[0]]["pred_logits"]))  # number of objects that network can decode
-        if empty_class == -1:
-            # the last value of prediction is a background
-            empty_class = len(eval[list(eval.keys())[0]]["pred_logits"][0])
+        annots = list()
+        img_id_last = eval[0]["image_id"]  # initial image_id
+        for idx in range(len(eval)):
+            # {"image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 4], "score": 0.9863572120666504},
+            img_id = eval[idx]["image_id"]
+            if img_id != img_id_last:
+                submit.append({
+                    "file": coco_imgs[img_id_last][FILE_NAME],
+                    "width": coco_imgs[img_id_last][WIDTH],
+                    "height": coco_imgs[img_id_last][HEIGHT],
+                    "annotations": annots
+                })
+                img_id_last = img_id
+                annots = list()
 
-        for img_id in eval.keys():
-            annots = list()
-            # for q in querry_list:
-                # get index of predicted label
-                # score = max(eval[img_id]["pred_logits"][q])
-                # cat_id = eval[img_id]["pred_logits"][q].index(score) + 1
-            for q in range(len(eval[img_id]["scores"])):
-                score = eval[img_id]["scores"][q]
-                cat_id = eval[img_id]["labels"][q]
-                if score > confidence and cat_id != empty_class and cat_id <= max_cat_id:
-                    bbox = eval[img_id]["pred_boxes"][0][q]
-
-                    annots.append({
-                        "score": score,
-                        "detectionClass": cat_id,
-                        "detectionString": coco_cats[cat_id],
-                        "box": eval[img_id]["boxes"][q]  # decode_bbox_detr(bbox)
-                    })
-
-            submit.append({
-                "file": coco_imgs[img_id],
-                "width": eval[img_id]["size"][WIDTH],
-                "height": eval[img_id]["size"][HEIGHT],
-                "annotations": annots
+            annots.append({
+                "score": eval[idx]["score"],
+                "detectionClass": eval[idx]["category_id"],
+                "detectionString": coco_cats[eval[idx]["category_id"]],
+                "box": list(encode_bbox(eval[idx]["bbox"], coco_imgs[img_id][WIDTH], coco_imgs[img_id][HEIGHT]))
             })
 
-    output_path = os.path.join(CONFIG["output_path"], "make_submission_file")
+    output_path = output_dir if output_dir != "" else os.path.join(CONFIG["output_path"], "make_submission_file")
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
@@ -747,6 +796,6 @@ if __name__ == "__main__":
             coco = make_coco(json_data, dataset_name, img_data, split_data)
             if args.eval_file != "":
                 # TODO: zatím funguje jen pro validační data!!!!!!!! předávat ještě další parametr na coco
-                make_submission_file(args.eval_file, coco[1], confidence=.9, empty_class=-1)
+                make_submission_file(args.eval_file, coco[1])
             else:
                 print("Warning: argument --eval_file was not set, submission file cannot be created.")
