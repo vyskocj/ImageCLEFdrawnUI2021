@@ -7,7 +7,10 @@ import cv2
 import torch
 import numpy as np
 
-from random import uniform
+import albumentations as A
+
+from math import ceil
+from random import uniform, seed
 from shutil import copyfile
 from datetime import datetime
 
@@ -19,6 +22,8 @@ from detectron2.data.datasets import register_coco_instances
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
 
+from detectron2.modeling import build_model
+from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.data import MetadataCatalog
 from detectron2.utils.visualizer import Visualizer
 from detectron2.engine import hooks, DefaultPredictor
@@ -29,20 +34,55 @@ from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 
 from src import dataset_tool
 
-
 CONFIG = {
     "wireframe": {
-        "lr_decay": 0.1,             # gamma
-        "lr_decay_epoch": []         # epochs (can be real number)
+        # albumentations augmentation settings
+        "cutout": True,                     # if False, cutout is not used
+        "cutout_max_holes": 4,
+        "cutout_max_size": 0.05,            # max hole width/height = cutout_max_size * 100 percent of image
+        # resize augmentation settings
+        "relative_resize_with_crop": True,  # if False, ResizeShortestEdge is used (default for detectron2)
+        "resize_ratio": 0.8,
+        "resize_ratio_delta": 0.2,          # just for training
+        "max_img_size": 1400,
+        # learning rate settings
+        "lr_decay": 0.5,                    # gamma
+        "lr_decay_epoch": [20, 30],         # epochs (can be real number), expected training for 40 epochs
+        # architecture settings
+        "aspect_ratios": [
+            [0.1, 0.5, 1.0, 1.5]
+        ],
+        "anchor_sizes": [
+            [16], [32], [64], [128], [256]
+        ]
     },
     "screenshot": {
+        # albumentations augmentation settings
+        "cutout": True,                     # if False, cutout is not used
+        "cutout_max_holes": 4,
+        "cutout_max_size": 0.05,            # max hole width/height = cutout_max_size * 100 percent of image
+        # resize augmentation settings
+        "relative_resize_with_crop": True,  # if False, ResizeShortestEdge is used (default for detectron2)
         "resize_ratio": 0.8,
-        "resize_ratio_delta": 0.1,   # just for training
-        "max_img_size": 2000,
-        "lr_decay": 0.5,             # gamma
-        "lr_decay_epoch": [10, ]     # epochs (can be real number)
+        "resize_ratio_delta": 0.2,          # just for training
+        "max_img_size": 1400,
+        # learning rate settings
+        "lr_decay": 0.5,                    # gamma
+        "lr_decay_epoch": [10, 15],         # epochs (can be real number), expected training for 20 epochs
+        # architecture settings
+        "aspect_ratios": [
+            [0.1, 0.5, 1.0, 1.5]
+        ],
+        "anchor_sizes": [
+            [32], [64], [128], [256], [512]
+        ],
+        # discarding data for Screenshot task
+        "discard_data": [            # which types of data shall be discarded in the training set
+            "hmg_imgs"
+        ],
+        "threshold_box": 0           # the threshold used for discarding data
     },
-    "checkpoint_period": 5,          # epoch
+    "checkpoint_period": 20,         # epoch
     "eval_period": 1,                # epoch
     "output_path": os.path.join(
         dataset_tool.CONFIG["output_path"], "model_output"
@@ -50,7 +90,73 @@ CONFIG = {
 }
 
 
-def custom_mapper_wf(dataset_dict):
+def seed_torch(seed_val=777):
+    seed(seed_val)
+    os.environ['PYTHONHASHSEED'] = str(seed_val)
+    np.random.seed(seed_val)
+    torch.manual_seed(seed_val)
+    torch.cuda.manual_seed(seed_val)
+    torch.backends.cudnn.deterministic = True
+
+
+def albumentations_transforms(image):
+    # cutout augmentation
+    if CONFIG[args.dataset]["cutout"] is True:
+        a_transf = A.Compose([
+            A.CoarseDropout(
+                max_holes=CONFIG[args.dataset]["cutout_max_holes"],
+                max_height=int(ceil(image.shape[0] * CONFIG[args.dataset]["cutout_max_size"])),
+                max_width=int(ceil(image.shape[1] * CONFIG[args.dataset]["cutout_max_size"])),
+                fill_value=0, p=0.5)
+        ])
+        image = a_transf(image=image)["image"]
+
+    return image
+
+
+def detectron2_transforms(image):
+    # set color / intensity augmentations
+    transforms = [
+        T.RandomApply(T.RandomBrightness(intensity_min=0.5, intensity_max=1.5),
+                      prob=0.5),
+        T.RandomApply(T.RandomContrast(intensity_min=0.5, intensity_max=1.5),
+                      prob=0.5)
+    ]
+
+    if args.greyscale is False:
+        # saturation cannot be applied on greyscale images
+        transforms.append(
+            T.RandomApply(T.RandomSaturation(intensity_min=0.5, intensity_max=1.5),
+                          prob=0.5)
+        )
+
+    # set random resize
+    if CONFIG[args.dataset]["relative_resize_with_crop"] is True:
+        x, y = float(CONFIG[args.dataset]["resize_ratio"]), float(CONFIG[args.dataset]["resize_ratio_delta"])
+        resize_ratio = uniform(x - y, x + y)
+
+        # random resize with crop
+        transforms.append(
+            T.Resize((
+                int(image.shape[0] * resize_ratio),
+                int(image.shape[1] * resize_ratio)
+            ))
+        )
+        transforms.append(
+            T.RandomCrop(
+                "absolute_range", (CONFIG[args.dataset]["max_img_size"], CONFIG[args.dataset]["max_img_size"])
+            )
+        )
+    else:
+        # default resize of detectron2
+        transforms.append(
+            T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING),
+        )
+
+    return transforms
+
+
+def custom_mapper_train(dataset_dict):
     """
     Mapper for wireframe task
 
@@ -62,20 +168,8 @@ def custom_mapper_wf(dataset_dict):
     image = utils.read_image(dataset_dict["file_name"], format=cfg.INPUT.FORMAT)
     utils.check_image_size(dataset_dict, image)
 
-    image, transforms = T.apply_transform_gens([
-        # from detectron2.data.detection_utils.py: build_augmentation
-        T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING),
-        # lets preserve RandomFlip - CANNOT be used when horizontal and vertical are False
-        # T.RandomFlip(horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal", vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
-        #              prob=0.5 if cfg.INPUT.RANDOM_FLIP != "none" else 0),
-        # new augmentations
-        T.RandomApply(T.RandomBrightness(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5),
-        T.RandomApply(T.RandomContrast(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5),
-        T.RandomApply(T.RandomSaturation(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5)
-    ], image)
+    image, transforms = T.apply_transform_gens(detectron2_transforms(image), image)
+    image = albumentations_transforms(image)
 
     image_shape = image.shape[:2]  # h, w
     # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,
@@ -95,57 +189,7 @@ def custom_mapper_wf(dataset_dict):
     return dataset_dict
 
 
-def custom_mapper_ss_train(dataset_dict):
-    """
-    Mapper for screenshot task
-
-    :param dataset_dict: annotation in Detectron2 Dataset format.
-    :return: dataset_dict
-    """
-    # Rewritten DatasetMapper (detectron2.data.dataset_mapper.py: __call__)
-    dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-    image = utils.read_image(dataset_dict["file_name"], format=cfg.INPUT.FORMAT)
-    utils.check_image_size(dataset_dict, image)
-
-    x, y = float(CONFIG["screenshot"]["resize_ratio"]), float(CONFIG["screenshot"]["resize_ratio_delta"])
-    resize_ratio = uniform(x - y, x + y)
-    image, transforms = T.apply_transform_gens([
-        T.Resize((
-            int(image.shape[0] * resize_ratio),
-            int(image.shape[1] * resize_ratio)
-        )),
-        T.RandomCrop("absolute_range", (CONFIG["screenshot"]["max_img_size"], CONFIG["screenshot"]["max_img_size"])),
-        # lets preserve RandomFlip - CANNOT be used when horizontal and vertical are False
-        # T.RandomFlip(horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal", vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
-        #              prob=0.5 if cfg.INPUT.RANDOM_FLIP != "none" else 0),
-        # new augmentations
-        T.RandomApply(T.RandomBrightness(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5),
-        T.RandomApply(T.RandomContrast(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5),
-        T.RandomApply(T.RandomSaturation(intensity_min=0.5, intensity_max=1.5),
-                      prob=0.5)
-    ], image)
-
-    image_shape = image.shape[:2]  # h, w
-    # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,
-    # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
-    # Therefore it's important to use torch.Tensor.
-    dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
-
-    annos = [
-        utils.transform_instance_annotations(obj, transforms, image_shape)
-        for obj in dataset_dict.pop("annotations")
-        if obj.get("iscrowd", 0) == 0
-    ]
-    instances = utils.annotations_to_instances(annos, image_shape)
-
-    dataset_dict["instances"] = utils.filter_empty_instances(instances)
-
-    return dataset_dict
-
-
-def custom_mapper_ss_test(dataset_dict):
+def custom_mapper_test_rnd_resize_with_crop(dataset_dict):
     """
     Mapper for screenshot task
 
@@ -159,8 +203,8 @@ def custom_mapper_ss_test(dataset_dict):
 
     image, transforms = T.apply_transform_gens([
         T.Resize((
-            int(image.shape[0] * CONFIG["screenshot"]["resize_ratio"]),
-            int(image.shape[1] * CONFIG["screenshot"]["resize_ratio"])
+            int(image.shape[0] * CONFIG[args.dataset]["resize_ratio"]),
+            int(image.shape[1] * CONFIG[args.dataset]["resize_ratio"])
         ))
     ], image)
 
@@ -230,21 +274,7 @@ class CustomSimpleTrainer(SimpleTrainer):
             self.act_step += 1
 
 
-class CustomTrainerWF(Trainer):
-    """
-    Trainer for wireframe task
-    """
-    def __init__(self, cfg, accumulate_batch_size):
-        super().__init__(cfg)
-
-        self._trainer = CustomSimpleTrainer(self.model, self.data_loader, self.optimizer, accumulate_batch_size)
-
-    @classmethod
-    def build_train_loader(cls, cfg):
-        return build_detection_train_loader(cfg, mapper=custom_mapper_wf)
-
-
-class CustomTrainerSS(Trainer):
+class CustomTrainer(Trainer):
     """
     Trainer for screenshot task
     """
@@ -255,17 +285,33 @@ class CustomTrainerSS(Trainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
-        return build_detection_train_loader(cfg, mapper=custom_mapper_ss_train)
+        return build_detection_train_loader(cfg, mapper=custom_mapper_train)
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
-        return build_detection_test_loader(cfg, dataset_name, mapper=custom_mapper_ss_test)
+        if CONFIG[args.dataset]["relative_resize_with_crop"] is True:
+            return build_detection_test_loader(cfg, dataset_name, mapper=custom_mapper_test_rnd_resize_with_crop)
+        else:
+            return build_detection_test_loader(cfg, dataset_name)
 
 
-class CustomPredictorSS(DefaultPredictor):
+class CustomPredictor(DefaultPredictor):
     """
     Predictor for screenshot task
     """
+    def __init__(self, cfg):
+        self.cfg = cfg.clone()  # cfg can be modified by model
+        self.model = build_model(self.cfg)
+        self.model.eval()
+        if len(cfg.DATASETS.TEST):
+            self.metadata = MetadataCatalog.get(cfg.DATASETS.TEST[0])
+
+        checkpointer = DetectionCheckpointer(self.model)
+        checkpointer.load(cfg.MODEL.WEIGHTS)
+
+        self.input_format = cfg.INPUT.FORMAT
+        assert self.input_format in ["RGB", "BGR", "L"], self.input_format
+
     def __call__(self, original_image):
         """
         Args:
@@ -282,11 +328,21 @@ class CustomPredictorSS(DefaultPredictor):
                 # whether the model expects BGR inputs or RGB
                 original_image = original_image[:, :, ::-1]
             height, width = original_image.shape[:2]
-            image = T.Resize((
-                int(height * CONFIG["screenshot"]["resize_ratio"]),
-                int(width * CONFIG["screenshot"]["resize_ratio"])
-            )).get_transform(original_image).apply_image(original_image)
-            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+
+            if CONFIG[args.dataset]["relative_resize_with_crop"] is True:
+                image = T.Resize((
+                    int(height * CONFIG["screenshot"]["resize_ratio"]),
+                    int(width * CONFIG["screenshot"]["resize_ratio"])
+                )).get_transform(original_image).apply_image(original_image)
+            else:
+                image = T.ResizeShortestEdge(
+                    [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
+                ).get_transform(original_image).apply_image(original_image)
+
+            if self.input_format == "L":
+                image = torch.as_tensor(np.ascontiguousarray(image))
+            else:
+                image = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
             inputs = {"image": image, "height": height, "width": width}
             predictions = self.model([inputs])[0]
@@ -300,7 +356,7 @@ def reg_dataset(train_imgs, train_json, valid_imgs, valid_json):
 
 def get_cfg_local(model_name, dataset_name, base_lr, batch_size, acum_batch_size, fpn_out_channels, fpn_fuse_type,
                   rbh_num_conv, rbh_num_fc, rbh_conv_dim, rbh_fc_dim, epochs, num_train_imgs, num_classes, maxdets,
-                  checkpoint, output_dir_suffix=None):
+                  greyscale, checkpoint, output_dir_main, output_dir_prefix=None, output_dir_suffix=None):
     # initialize the configuration
     ret_cfg = get_cfg()
 
@@ -320,8 +376,16 @@ def get_cfg_local(model_name, dataset_name, base_lr, batch_size, acum_batch_size
     ret_cfg.MODEL.ROI_BOX_HEAD.CONV_DIM = rbh_conv_dim  # dimension of all conv layers in a box head
     ret_cfg.MODEL.ROI_BOX_HEAD.FC_DIM = rbh_fc_dim      # dimension of all fc layers in a box head and box predictor
 
+    # Anchor boxes
+    ret_cfg.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = CONFIG[dataset_name]["aspect_ratios"]
+    ret_cfg.MODEL.ANCHOR_GENERATOR.SIZES = CONFIG[dataset_name]["anchor_sizes"]
+
     # input
     ret_cfg.INPUT.RANDOM_FLIP = "none"
+    if greyscale:
+        ret_cfg.INPUT.FORMAT = "L"  # greyscale
+    else:
+        pass                        # GBR as a default
 
     # dataset settings
     ret_cfg.DATASETS.TRAIN = ("local_dataset_train",)
@@ -332,13 +396,11 @@ def get_cfg_local(model_name, dataset_name, base_lr, batch_size, acum_batch_size
     ret_cfg.TEST.EVAL_PERIOD = int(CONFIG["eval_period"] * num_train_imgs / batch_size)
     ret_cfg.VIS_PERIOD = ret_cfg.TEST.EVAL_PERIOD
     ret_cfg.TEST.DETECTIONS_PER_IMAGE = maxdets
-    # TODO: vypnuté pro trénování
-    # ret_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7   # to eliminate predictions with probability under 70 %
 
     # learning settings
     ret_cfg.SOLVER.BASE_LR = base_lr
-    ret_cfg.SOLVER.WARMUP_FACTOR = 1.0 / 1000 / acum_batch_size
-    ret_cfg.SOLVER.WARMUP_ITERS = 1000 * acum_batch_size
+    ret_cfg.SOLVER.WARMUP_FACTOR = 1.0 / int(num_train_imgs / batch_size) / acum_batch_size  # warmup for 1 epoch
+    ret_cfg.SOLVER.WARMUP_ITERS = int(num_train_imgs / batch_size) * acum_batch_size         # warmup for 1 epoch
     ret_cfg.SOLVER.GAMMA = CONFIG[dataset_name]["lr_decay"]       # correlation with STEPS and BASE_LR
     ret_cfg.SOLVER.STEPS = [                                      # learning rate decay in STEPS epochs by GAMMA
         int(e * num_train_imgs / batch_size) for e in CONFIG[dataset_name]["lr_decay_epoch"]
@@ -349,7 +411,14 @@ def get_cfg_local(model_name, dataset_name, base_lr, batch_size, acum_batch_size
 
     # output path
     suffix = "" if (output_dir_suffix is None or output_dir_suffix == "") else f"_{output_dir_suffix}"
-    ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], dataset_name, f"{model_name}{suffix}")
+    prefix = "" if (output_dir_prefix is None or output_dir_prefix == "") else f"{output_dir_prefix}_"
+    color_depth = "greyscale" if greyscale is True else ret_cfg.INPUT.FORMAT
+    if output_dir_main == "":
+        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], dataset_name, color_depth,
+                                          f"{prefix}{model_name}{suffix}")
+    else:
+        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], output_dir_main, color_depth,
+                                          f"{prefix}{model_name}{suffix}")
     # check if output path exists
     output_orig = ret_cfg.OUTPUT_DIR
     idx = 1
@@ -390,15 +459,24 @@ def show_predictions(predictor, imgs_dir, output_dir, category_names, lim_predic
     num_imgs = len(os.listdir(imgs_dir))
     for img_id, img_name in enumerate(os.listdir(imgs_dir), start=1):
         # read an image and predict
-        img = cv2.imread(os.path.join(imgs_dir, img_name))
+        if cfg.INPUT.FORMAT == "L":  # greyscale
+            img = cv2.imread(os.path.join(imgs_dir, img_name), cv2.IMREAD_GRAYSCALE)
+        else:
+            img = cv2.imread(os.path.join(imgs_dir, img_name))
         outputs = predictor(img)
 
         # visualize the predictions
-        v = Visualizer(img[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]))
+        if cfg.INPUT.FORMAT == "L":
+            v = Visualizer(img, MetadataCatalog.get(cfg.DATASETS.TRAIN[0]))
+        else:  # GBR
+            v = Visualizer(img[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]))
         out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
 
         # save an image
-        cv2.imwrite(os.path.join(output_dir, img_name), out.get_image()[:, :, ::-1])
+        if cfg.INPUT.FORMAT == "L":
+            cv2.imwrite(os.path.join(output_dir, img_name), out.get_image())
+        else:  # GBR
+            cv2.imwrite(os.path.join(output_dir, img_name), out.get_image()[:, :, ::-1])
 
         # print status of processing
         time_now = datetime.now()
@@ -424,7 +502,7 @@ if __name__ == "__main__":
     )
     parser.add_argument('-lr', '--base_lr', default=.0025, help='Learning rate.')
     parser.add_argument('-b', '--batch_size', default=4, help='Batch size.')
-    parser.add_argument('-a', '--accum_batch_size', default=1, help='Batch size of accumulate gradient.')
+    parser.add_argument('-a', '--accum_grad', default=1, help='Batch size of accumulate gradient.')
 
     parser.add_argument('-fc', '--fpn_channels', default=256, help='Number of Feature Pyramid Network channels.')
     parser.add_argument('-ff', '--fpn_fuse_type', default="sum", help='A fuse type of Feature Pyramid Network:'
@@ -438,8 +516,12 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--maxdets', default=320, help='Maximum number of detections.')
     parser.add_argument('-e', '--epochs', default=200, help='Number of training epochs.')
 
+    parser.add_argument('-pre', '--prefix', default="", help='Prefix for the output.')
+
     # Train / test arguments
     parser.add_argument('-T', '--train', action='store_true', help='Train the network.')
+    parser.add_argument('-TO', '--train_overfit', action='store_true', help='Train the network and then merge training'
+                                                                            ' and validation data to overfit it.')
     parser.add_argument('-C', '--checkpoint', default='', help='Path to the checkpoint of your model'
                                                                ' (model_final.pth).')
     parser.add_argument('-R', '--resume', action='store_true', help='Resume training from last checkpoint.'
@@ -447,11 +529,11 @@ if __name__ == "__main__":
     parser.add_argument('-P', '--predict', action='store_true', help='Show predictions of the model. If parameter -T is'
                                                                      ' used, predictions fot the Test set are stored in'
                                                                      ' the same directory as the trained model.')
+
+    parser.add_argument('-G', '--greyscale', action='store_true', help='Use the greyscale images.')
+
     parser.add_argument('-DT', '--dataset', default='wireframe',
                         help='Dataset for training: ["wireframe", "screenshot"].')
-    parser.add_argument('-DP', '--data_predict', default='test',
-                        help='The set which predictions shall be visualized. Relevant only for parameter -P (parameter'
-                             ' -T must not be used), supported values: ["train", "valid", "test"].')  # TODO: dodělat
     parser.add_argument('-LP', '--lim_predict', default=0, help='Limit the number of visualized predictions. Relevant'
                                                                 ' with parameter -P (parameter -T can also be used).'
                                                                 ' If "0" is passed, predictions for all images are'
@@ -461,13 +543,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # =================================================================================================================
+    if args.train_overfit is True:
+        args.train = True
+
+    seed_torch(777)
 
     # get the dataset information
     path_to_imgs, path_to_json = list(), list()
     dataset_suff = list()
     split_data = ""
+    train_suff = ""
     eval_json, eval_imgs = "", ""
     if args.dataset == "wireframe":
+        discard_data = [[]]    # no removing data from the sets
+        threshold_box = 0      # not relevant without discarding data
+
         path_to_imgs = [dataset_tool.CONFIG["wireframe_data"]]
         path_to_json = [dataset_tool.CONFIG["wireframe_json"]]
         dataset_suff = [""]
@@ -475,9 +565,16 @@ if __name__ == "__main__":
 
         eval_imgs = dataset_tool.CONFIG["wireframe_eval_data"]
     elif args.dataset == "screenshot":
+        discard_data = [CONFIG["screenshot"]["discard_data"], []]  # discard wrong data only for training set
+        threshold_box = CONFIG["screenshot"]["threshold_box"]
+
         path_to_imgs = [dataset_tool.CONFIG["screenshot_train_data"], dataset_tool.CONFIG["screenshot_valid_data"]]
         path_to_json = [dataset_tool.CONFIG["screenshot_train_json"], dataset_tool.CONFIG["screenshot_valid_json"]]
-        dataset_suff = ["_train", "_valid"]
+        if "hmg_imgs" in CONFIG["screenshot"]["discard_data"]:
+            train_suff += f"_thresholdImgs"
+        if "hmg_boxes" in CONFIG["screenshot"]["discard_data"]:
+            train_suff += f"_thresholdBox{threshold_box}"
+        dataset_suff = [f"_train{train_suff}", f"_valid"]
         split_data = "false"
 
         eval_imgs = dataset_tool.CONFIG["screenshot_eval_data"]
@@ -491,7 +588,8 @@ if __name__ == "__main__":
     num_valid_imgs = 0
     num_catetogies = 0
     for i in range(len(path_to_imgs)):
-        coco = dataset_tool.make_coco(path_to_json[i], f"{args.dataset}{dataset_suff[i]}", path_to_imgs[i], split_data)
+        coco = dataset_tool.make_coco(path_to_json[i], f"{args.dataset}{dataset_suff[i]}", path_to_imgs[i], split_data,
+                                      discard=discard_data[i], threshold_box=threshold_box, save_discarded=False)
         if i == 0:
             num_train_imgs = len(coco[0]["images"])
             num_catetogies = len(coco[0]["categories"])
@@ -509,8 +607,15 @@ if __name__ == "__main__":
         path_to_train_imgs = path_to_imgs[0]
         path_to_valid_imgs = path_to_imgs[1]
 
-    path_to_train_json = os.path.join(dataset_tool.CONFIG["output_path"], "make_coco", f"coco_{args.dataset}_train.json")
-    path_to_valid_json = os.path.join(dataset_tool.CONFIG["output_path"], "make_coco", f"coco_{args.dataset}_valid.json")
+    if args.dataset == "screenshot":
+        path_to_train_json = os.path.join(dataset_tool.CONFIG["output_path"], "make_coco",
+                                          f"coco_{args.dataset}_train{train_suff}.json")
+    else:
+        path_to_train_json = os.path.join(dataset_tool.CONFIG["output_path"], "make_coco",
+                                          f"coco_{args.dataset}_train.json")
+
+    path_to_valid_json = os.path.join(dataset_tool.CONFIG["output_path"], "make_coco",
+                                      f"coco_{args.dataset}_valid.json")
 
     # register the datasets
     reg_dataset(path_to_train_imgs, path_to_train_json, path_to_valid_imgs, path_to_valid_json)
@@ -521,15 +626,20 @@ if __name__ == "__main__":
         coco_eval = dict()  # dummy
 
     # get configuration and prepare an output directory
-    out_dir_suff = f"lr_{args.base_lr}_b_{args.batch_size}_a_{args.accum_batch_size}_fc_{args.fpn_channels}" \
+    out_dir_suff = f"lr_{args.base_lr}_b_{args.batch_size}_a_{args.accum_grad}_fc_{args.fpn_channels}" \
                    f"_ff_{args.fpn_fuse_type}_bc_{args.rbh_num_conv}_bf_{args.rbh_num_fc}_bcd_{args.rbh_conv_dim}" \
                    f"_bfd_{args.rbh_fc_dim}_d_{args.maxdets}_e_{args.epochs}"
+
+    output_dir_main = ""             # output will be stored in the dataset_name directory
+    if args.train is False and args.predict is True:
+        output_dir_main = "predict"  # output will be stored in the "predict" directory
+
     cfg = get_cfg_local(
-        args.model, args.dataset, float(args.base_lr), int(args.batch_size), int(args.accum_batch_size),
+        args.model, args.dataset, float(args.base_lr), int(args.batch_size), int(args.accum_grad),
         int(args.fpn_channels), args.fpn_fuse_type, int(args.rbh_num_conv), int(args.rbh_num_fc),
         int(args.rbh_conv_dim), int(args.rbh_fc_dim), int(args.epochs), num_train_imgs=num_train_imgs,
-        num_classes=num_catetogies, maxdets=int(args.maxdets), checkpoint=args.checkpoint,
-        output_dir_suffix=out_dir_suff
+        num_classes=num_catetogies, maxdets=int(args.maxdets), greyscale=args.greyscale, checkpoint=args.checkpoint,
+        output_dir_main=output_dir_main, output_dir_prefix=args.prefix, output_dir_suffix=out_dir_suff
     )
     os.makedirs(cfg.OUTPUT_DIR)
     if args.resume is True:
@@ -545,24 +655,18 @@ if __name__ == "__main__":
 
     # train the model
     if args.train is True:
-        for phase in ["training", "overfitting"]:
+        phases = ["training"]
+        if args.train_overfit is True:
+            phases.append("overfitting")
+
+        for phase in phases:
             if phase == "overfitting":
                 # load new config including validation dataset for training
                 get_cfg_after_train(num_train_imgs + num_valid_imgs, int(args.batch_size))
                 os.makedirs(cfg.OUTPUT_DIR)
 
             # get trainer
-            if args.dataset == "wireframe":
-                trainer = CustomTrainerWF(cfg, int(args.accum_batch_size))
-            else:  # args.dataset == "screenshot"
-                trainer = CustomTrainerSS(cfg, int(args.accum_batch_size))
-
-            # add TTA evaluation after training
-            if args.dataset != "screenshot":
-                # TTA is not supported for screenshot set yet
-                trainer.register_hooks(
-                    [hooks.EvalHook(0, lambda: trainer.test_with_TTA(cfg, trainer.model))]
-                )
+            trainer = CustomTrainer(cfg, int(args.accum_grad))
 
             # train the model from zero or continue training
             trainer.resume_or_load(resume=False if ((phase == "overfitting") or (args.resume is False)) else True)
@@ -594,9 +698,27 @@ if __name__ == "__main__":
                 if args.predict is True:
                     categories = [c["name"] for c in coco_eval["categories"]]
                     cfg.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")   # weights from the checkpoint
-                    if args.dataset == "wireframe":
-                        show_predictions(DefaultPredictor(cfg), eval_imgs, eval_output, categories,
-                                         int(args.lim_predict))
-                    else:  # args.dataset == "screenshot"
-                        show_predictions(CustomPredictorSS(cfg), eval_imgs, eval_output, categories,
-                                         int(args.lim_predict))
+                    show_predictions(CustomPredictor(cfg), eval_imgs, eval_output, categories,
+                                     int(args.lim_predict))
+    elif args.predict is True:
+        # evaluate
+        trainer = CustomTrainer(cfg, int(args.accum_grad))
+
+        trainer.resume_or_load(resume=False)  # load checkpoint
+
+        # create COCO evaluator
+        evaluator = COCOEvaluator("local_dataset_eval", ("bbox",), False, output_dir=cfg.OUTPUT_DIR)
+        eval_loader = trainer.build_test_loader(cfg, "local_dataset_eval")
+        inference_on_dataset(trainer.model, eval_loader, evaluator)  # it returns AP measurements
+
+        # make submission file
+        dataset_tool.make_submission_file(
+            os.path.join(cfg.OUTPUT_DIR, "coco_instances_results.json"),
+            coco_eval,
+            cfg.OUTPUT_DIR
+        )
+
+        # predict
+        categories = [c["name"] for c in coco_eval["categories"]]
+        show_predictions(CustomPredictor(cfg), eval_imgs, cfg.OUTPUT_DIR, categories,
+                         int(args.lim_predict))

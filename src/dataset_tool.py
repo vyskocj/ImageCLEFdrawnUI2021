@@ -1,10 +1,11 @@
-from PIL import Image
+from PIL import Image, ImageFilter, ImageStat
 from datetime import datetime, timedelta
 from shutil import copyfile
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import random
+import math
 import json
 import os
 
@@ -139,8 +140,97 @@ def vis_data(json_path, data_path, show=False, save=True, set_name="data"):
             print(f"You can find files in: {output_path}")
 
 
-def make_coco(json_path, set_name=None, data_path=None, split="false", reproducibility_set=False,
-              report_wrong_img_size=False):
+def get_moving_threshold(img_size):
+    # should be used only for screenshot task
+    # The thresholds are used for IMAGES!
+    if img_size <= 500**2:
+        return 2.5
+    if img_size <= 600**2:           # threshold max 3.5
+        return 3.5
+    elif img_size <= 900**2:         # threshold max 2.8
+        return 2.8
+    elif img_size <= 1200**2:        # threshold max 2.5
+        return 2.5
+    else:                            # threshold max 0.8
+        return 0.8
+
+
+def is_homo(image, threshold, is_bbox, image_name=""):
+    # convert the image to greyscale
+    img = image.convert("L")
+
+    # detect edges in the image
+    img = img.filter(ImageFilter.FIND_EDGES)
+
+    if is_bbox is False:
+        # get threshold for image
+        threshold = get_moving_threshold(image.size[0] * image.size[1])
+
+    # compute mean of edges and return if the image is homogeneous
+    img_mean = ImageStat.Stat(img).mean[0]
+    is_homogeneous = img_mean < threshold
+
+    # save image
+    if image_name != "" and is_homogeneous:
+        img_size = image.size[0] * image.size[1]
+        if img_size <= 25**2:
+            img_size = "max_25x25"
+        elif img_size <= 50**2:
+            img_size = "max_50x50"
+        elif img_size <= 100**2:
+            img_size = "max_100x100"
+        elif img_size <= 200**2:
+            img_size = "max_200x200"
+        elif img_size <= 300**2:
+            img_size = "max_300x300"
+        elif img_size <= 400**2:
+            img_size = "max_400x400"
+        elif img_size <= 500**2:
+            img_size = "max_500x500"
+        elif img_size <= 600**2:
+            img_size = "max_600x600"
+        elif img_size <= 900**2:
+            img_size = "max_900x900"
+        elif img_size <= 1000**2:
+            img_size = "max_1000x1000"
+        else:
+            img_size = "other_size"
+
+        output_path = os.path.join(CONFIG["output_path"], "is_homo", "bbox" if is_bbox else "img", img_size)
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
+        image.save(os.path.join(output_path, f"{img_mean}_{image_name}_orig.png"))  # f"{image_name}_orig.png"))
+        img.save(os.path.join(output_path, f"{img_mean}_{image_name}_edge.png"))  # f"{image_name}_edge.png"))
+
+    return is_homogeneous
+
+
+def make_coco(json_path, set_name=None, data_path=None, split="false", reproducibility_set=False, discard=[],
+              threshold_box=-1, report_wrong_img_size=False, save_discarded=False):
+    """
+    Make COCO-style annotations.
+
+    :param json_path: path to the drawnUI annotations (.json file)
+    :param set_name: dataset name (optional)
+    :param data_path: path to the image data (optional)
+    :param split: split dataset, one of ["true", "false", "random"]. Default is "false" - data are preserved. If "true"
+                  then data are split according to the "<set_name>_indexes.json" file. If "random" then data are
+                  randomly split.
+    :param reproducibility_set: save indexes of the split data to the "<set_name>_indexes.json" file
+    :param discard: discard some annotations or whole images, supported list values: ["outlier_boxes",
+                       "hmg_boxes", "hmg_imgs"]. Outlier boxes are annotations which coordinates (including
+                       width/height) belongs outside the image. Homogeneous box/image is an element of similar
+                       intensity (see parameter threshold_box).
+    :param threshold_box: the tolerated threshold that the object is homogeneous. Edge filtering -> sum and norm
+                          filtered image -> application the threshold.
+    :param report_wrong_img_size: print image names with wrong sizes
+    :param save_discarded: save discarded images
+    :return: list of COCO annotations and output path where the annotations were saved
+    """
+    if len(discard) != 0:
+        print(f"Discarding data for dataset: {set_name}")
+
     def _process(metadata_list, set_type=None):
         # initialization of coco dictionary
         coco = {
@@ -162,6 +252,10 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
         # process the metadata
         ann_id = 1
         miss_img = 0  # missing img in the data directory
+        img = None
+        discarded_imgs = 0
+        discarded_outlier_boxes = 0
+        discarded_homogen_boxes = 0
         for img_id, metadata in enumerate(metadata_list, start=1):
             file, width, height, annot = decode(metadata)
 
@@ -173,12 +267,17 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
 
             # check the image size
             if data_path is not None:
-                with Image.open(os.path.join(data_path, file)) as img:
-                    if width != img.size[0] or height != img.size[1]:
-                        if report_wrong_img_size:
-                            print(f"Image {file} have (w, h) size {img.size} since annotation refers to"
-                                  f" {(width, height)}")
-                        width, height = img.size
+                img = Image.open(os.path.join(data_path, file))
+                if width != img.size[0] or height != img.size[1]:
+                    if report_wrong_img_size:
+                        print(f"Image {file} have (w, h) size {img.size} since annotation refers to"
+                              f" {(width, height)}")
+                    width, height = img.size
+
+            if ("hmg_imgs" in discard) and is_homo(img, -1, is_bbox=False,
+                                                    image_name=file.split(".")[0] if save_discarded is True else ""):
+                discarded_imgs += 1
+                continue
 
             # append info about image
             coco["images"].append(
@@ -190,13 +289,25 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
                 }
             )
 
-            for ann in annot:
+            ann_id_old = ann_id
+            for a, ann in enumerate(annot, start=1):
                 if ann["detectionString"] not in categories.keys():
                     # store label to the category
                     categories[ann["detectionString"]] = ann["detectionClass"]
 
                 # append annotation
                 x, y, w, h = decode_bbox(ann["box"], width, height)
+                if ("outlier_boxes" in discard) and (((x + w - .001) > width) or ((y + h - .001) > height)):
+                    # NOTE: a small numerical error may occur after calling decode_bbox (thanks to multiplication of
+                    #       relative numbers) -> delta should be used to suppress false outliers
+                    discarded_outlier_boxes += 1
+                    continue
+
+                if ("hmg_boxes" in discard) and is_homo(img.crop((x, y, x + w, y + h)), threshold_box, True,
+                                                         f"{file.split('.')[0]}_bbox_{a}"if save_discarded else ""):
+                    discarded_homogen_boxes += 1
+                    continue
+
                 coco["annotations"].append(
                     {
                         "id": ann_id,
@@ -209,6 +320,9 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
                     }
                 )
                 ann_id += 1
+
+            if ann_id_old == ann_id:
+                coco["images"].pop(-1)
 
         # sort categories by id and store them in the coco dictionary
         cat_sorted = sorted(zip(
@@ -236,6 +350,14 @@ def make_coco(json_path, set_name=None, data_path=None, split="false", reproduci
                 json.dump(coco, coco_file)
                 print(f"COCO annotation file saved: {output_path}")
                 print(f"Number of missing images: {miss_img}")
+                if len(discard) != 0:
+                    print(f"Used threshold for bbox: {threshold_box}")
+                if discarded_imgs != 0:
+                    print(f"Discarded images: {discarded_imgs}")
+                if discarded_outlier_boxes != 0:
+                    print(f"Discarded bounding box outliers: {discarded_outlier_boxes}")
+                if discarded_homogen_boxes != 0:
+                    print(f"Discarded homogeneous boxes: {discarded_homogen_boxes}")
                 print("")
 
         return coco
@@ -400,6 +522,24 @@ def get_stats(coco_data, set_name=None, relative=True):
                 "height": {
                     "x": [],  # the height
                     "y": []   # number of images with this height
+                },
+                "aspect_ratio": {
+                    "<1": {
+                        "x": [],
+                        "y": []
+                    },
+                    "=1": {
+                        "x": [],
+                        "y": []
+                    },
+                    ">1": {
+                        "x": [],
+                        "y": []
+                    }
+                },
+                "sqrt(h_w)": {
+                    "x": [],
+                    "y": []
                 }
             },
         },
@@ -424,6 +564,24 @@ def get_stats(coco_data, set_name=None, relative=True):
                 "height": {
                     "x": [],  # the height
                     "y": []   # number of bboxes with this height
+                },
+                "aspect_ratio": {
+                    "<1": {
+                        "x": [],
+                        "y": []
+                    },
+                    "=1": {
+                        "x": [],
+                        "y": []
+                    },
+                    ">1": {
+                        "x": [],
+                        "y": []
+                    }
+                },
+                "sqrt(h_w)": {
+                    "x": [],
+                    "y": []
                 }
             },
         },
@@ -491,7 +649,9 @@ def get_stats(coco_data, set_name=None, relative=True):
 
     def _sort_bins():
         for b in [stats["image"]["bins"]["width"], stats["image"]["bins"]["height"],
-                  stats["bbox"]["bins"]["width"], stats["bbox"]["bins"]["height"]]:
+                  stats["bbox"]["bins"]["width"], stats["bbox"]["bins"]["height"],
+                  stats["bbox"]["bins"]["aspect_ratio"]["<1"], stats["bbox"]["bins"]["aspect_ratio"]["=1"],
+                  stats["bbox"]["bins"]["aspect_ratio"][">1"], stats["bbox"]["bins"]["sqrt(h_w)"]]:
             x, y = zip(*sorted(zip(
                 b["x"], b["y"]
             )))
@@ -504,6 +664,21 @@ def get_stats(coco_data, set_name=None, relative=True):
     num_imgs = len(coco_data["images"])
     print(f"Getting {set_name} statistics..." if set_name is not None else "Getting dataset statistics...")
     time = datetime(2020, 1, 1)
+
+    # init bins
+    for t in ["<1", ">1"]:
+        if t == "<1":
+            stats["bbox"]["bins"]["aspect_ratio"][t]["x"] = [round(0.01 * i, 2) for i in range(0, 100)]
+        else:
+            stats["bbox"]["bins"]["aspect_ratio"][t]["x"] = [round(1.01 + 0.01 * i, 2) for i in range(0, 20000)]
+        stats["bbox"]["bins"]["aspect_ratio"][t]["y"] = [0] * len(stats["bbox"]["bins"]["aspect_ratio"][t]["x"])
+
+    stats["bbox"]["bins"]["aspect_ratio"]["=1"]["x"] = [1.00]
+    stats["bbox"]["bins"]["aspect_ratio"]["=1"]["y"] = [0]
+
+    stats["bbox"]["bins"]["sqrt(h_w)"]["x"] = [10 * i for i in range(0, 300)]
+    stats["bbox"]["bins"]["sqrt(h_w)"]["y"] = [0] * len(stats["bbox"]["bins"]["sqrt(h_w)"]["x"])
+
     for img_id, img in enumerate(coco_data["images"], 1):
         # print status of processing
         time_now = datetime.now()
@@ -524,6 +699,35 @@ def get_stats(coco_data, set_name=None, relative=True):
             else:
                 _get_stats("bbox", "width", ann_id)
                 _get_stats("bbox", "height", ann_id)
+
+            # get aspect ratio
+            bbox_w = coco_data["annotations"][ann_id - 1]["bbox"][2]
+            bbox_h = coco_data["annotations"][ann_id - 1]["bbox"][3]
+            aspect_ratio = round(bbox_h / (bbox_w + 0.00000000001), 2)
+
+            for type in ["<1", "=1", ">1"]:
+                if type == "<1" and aspect_ratio >= 1:
+                    continue
+                elif type == ">1" and aspect_ratio <= 1:
+                    continue
+                elif type == "=1" and aspect_ratio != 1:
+                    continue
+
+                # search for the index and increase counter
+                bin_index = stats["bbox"]["bins"]["aspect_ratio"][type]["x"].index(round(aspect_ratio, 2))
+                stats["bbox"]["bins"]["aspect_ratio"][type]["y"][bin_index] += 1
+
+            # sizes
+            w_h = coco_data["annotations"][ann_id - 1]["bbox"][2] * coco_data["annotations"][ann_id - 1]["bbox"][3]
+            size = int(round(math.sqrt(w_h), -1))
+            if size not in stats["bbox"]["bins"]["sqrt(h_w)"]["x"]:
+                # append new value
+                stats["bbox"]["bins"]["sqrt(h_w)"]["x"].append(size)
+                stats["bbox"]["bins"]["sqrt(h_w)"]["y"].append(1)
+            else:
+                # search for the index and increase counter
+                bin_index = stats["bbox"]["bins"]["sqrt(h_w)"]["x"].index(size)
+                stats["bbox"]["bins"]["sqrt(h_w)"]["y"][bin_index] += 1
 
             # actualize label frequency
             cat_id = coco_data["annotations"][ann_id - 1]["category_id"]
@@ -550,6 +754,24 @@ def get_stats(coco_data, set_name=None, relative=True):
 
     # sort all bins
     _sort_bins()
+
+    non_zero_asprat = [i for i, e in enumerate(stats["bbox"]["bins"]["aspect_ratio"][">1"]["y"]) if e > 0]
+    lst_asprat = non_zero_asprat[-1]
+    for t in ["<1", "=1", ">1"]:
+        if t == ">1":
+            stats["bbox"]["bins"]["aspect_ratio"][t]["x"] = stats["bbox"]["bins"]["aspect_ratio"][t]["x"][:lst_asprat]
+            stats["bbox"]["bins"]["aspect_ratio"][t]["y"] = stats["bbox"]["bins"]["aspect_ratio"][t]["y"][:lst_asprat]
+
+        # to have probabilities
+        stats["bbox"]["bins"]["aspect_ratio"][t]["y"] = [i / ann_id
+                                                         for i in stats["bbox"]["bins"]["aspect_ratio"][t]["y"]]
+
+    stats["bbox"]["bins"]["sqrt(h_w)"]["x"] = stats["bbox"]["bins"]["sqrt(h_w)"]["x"][:100]
+    stats["bbox"]["bins"]["sqrt(h_w)"]["y"] = stats["bbox"]["bins"]["sqrt(h_w)"]["y"][:100]
+
+    # to have probabilities
+    stats["bbox"]["bins"]["sqrt(h_w)"]["y"] = [i / ann_id
+                                               for i in stats["bbox"]["bins"]["sqrt(h_w)"]["y"]]
 
     # save data, if required
     if set_name is not None:
@@ -595,11 +817,21 @@ def vis_stats(stats_data, set_name=None, show=False, save=True):
     for w in ["image", "bbox"]:
         # b = bin; l = label
         for b, l in [(stats_data[w]["bins"]["width"], "width"),
-                     (stats_data[w]["bins"]["height"], "height")]:
+                     (stats_data[w]["bins"]["height"], "height"),
+                     (stats_data[w]["bins"]["aspect_ratio"], "aspect_ratio"),
+                     (stats_data[w]["bins"]["sqrt(h_w)"], "sqrt(h_w)")]:
+            if (l == "aspect_ratio" and w != "bbox") or (l == "sqrt(h_w)" and w != "bbox"):
+                continue
+            elif l == "aspect_ratio" and w == "bbox":
+                b = {
+                    "x": b["<1"]["x"] + b["=1"]["x"] + b[">1"]["x"][:100],
+                    "y": b["<1"]["y"] + b["=1"]["y"] + b[">1"]["y"][:100]
+                }
+
             # set x as list from 0 to number of values, it is used as new x axis for plotting
             x = [i for i in range(len(b["x"]))]
             max_i = len(x) - 1
-            num_ticks = 30
+            num_ticks = 21
 
             # get original ticks and ticks used for plotting
             if isinstance(b["x"][0], int):
@@ -612,16 +844,16 @@ def vis_stats(stats_data, set_name=None, show=False, save=True):
                 ticks_orig = [round(b["x"][int(max_i * i / (num_ticks - 1))], 3) for i in range(num_ticks)]
 
             # plot an figure
-            fig = plt.figure(figsize=(20, 5))
+            fig = plt.figure(figsize=(15, 5))
             plt.bar(x, b["y"])
             plt.title(f'Occurrence of {w} {l}s in {set_name}')
             plt.xticks(ticks_plot, ticks_orig)
             plt.xlabel(l)
-            plt.ylabel(f'occurrences')
+            plt.ylabel(f'probability')
             if show:
                 plt.show()
             if save:
-                fig.savefig(os.path.join(output_path, f"{set_name}_{w}_{l}.png"))
+                fig.savefig(os.path.join(output_path, f"{set_name}_{w}_{l}.eps"), format='eps')
 
             # close plot / save memory
             plt.close()
@@ -635,8 +867,9 @@ def vis_stats(stats_data, set_name=None, show=False, save=True):
                 top_10 = [f"%.3f/%d" % (x[-i], y[-i]) for i in range(1, 11)]
             else:
                 top_10 = [f"%d/%d" % (x[-i], y[-i]) for i in range(1, 11)]
-            s = [stats_data[w]['avg'][l], stats_data[w]['min'][l], stats_data[w]['max'][l]]
-            _print(f"[Avg, Min, Max] {w} {l}: {s}")
+            if l != "aspect_ratio" and l != "sqrt(h_w)":
+                s = [stats_data[w]['avg'][l], stats_data[w]['min'][l], stats_data[w]['max'][l]]
+                _print(f"[Avg, Min, Max] {w} {l}: {s}")
             _print(f"Top 10 {w} {l}s ({l}/cnt): {top_10}")
             _print("")
 
@@ -692,6 +925,9 @@ def make_submission_file(eval_json, coco_data, output_dir=""):
             # {"image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 4], "score": 0.9863572120666504},
             img_id = eval[idx]["image_id"]
             if img_id != img_id_last:
+                if len(annots) > 300:
+                    annots = annots[:300]
+
                 submit.append({
                     "file": coco_imgs[img_id_last][FILE_NAME],
                     "width": coco_imgs[img_id_last][WIDTH],
@@ -706,6 +942,17 @@ def make_submission_file(eval_json, coco_data, output_dir=""):
                 "detectionClass": eval[idx]["category_id"],
                 "detectionString": coco_cats[eval[idx]["category_id"]],
                 "box": list(encode_bbox(eval[idx]["bbox"], coco_imgs[img_id][WIDTH], coco_imgs[img_id][HEIGHT]))
+            })
+
+        if len(annots) != 0:
+            if len(annots) > 300:
+                annots = annots[:300]
+
+            submit.append({
+                "file": coco_imgs[img_id_last][FILE_NAME],
+                "width": coco_imgs[img_id_last][WIDTH],
+                "height": coco_imgs[img_id_last][HEIGHT],
+                "annotations": annots
             })
 
     output_path = output_dir if output_dir != "" else os.path.join(CONFIG["output_path"], "make_submission_file")
@@ -765,11 +1012,12 @@ if __name__ == "__main__":
     coco = {}
     for json_data, img_data, dataset_name, split_data in process_data:
         if args.vis_data:
-            #vis_data("/mnt/data/ImageCLEFdrawnUI2021/__OUTPUT__/make_submission_file/submission.json", img_data, show=False, save=True, set_name="detr_output_wf")
-            vis_data(json_data, img_data, show=False, save=True, set_name=dataset_name)
+            vis_data("D:/drawnUI2021_experimenty_new/exp6_backbones/wireframe/exp6_011_e14_faster_rcnn_X_101_32x8d_FPN_3x_lr_0.0025_b_1_a_4_fc_256_ff_sum_bc_0_bf_2_bcd_256_bfd_1024_d_320_e_14/submission/submission.json", "D:/ImageCLEFdrawnUI2021/data/wireframe_test_set/test", show=False, save=True, set_name="detr_output_wf")
+            #vis_data(json_data, img_data, show=False, save=True, set_name=dataset_name)
 
         if args.make_coco:
-            coco = make_coco(json_data, dataset_name, img_data, split_data, reproducibility_set=False)
+            coco = make_coco(json_data, dataset_name, img_data, split_data, reproducibility_set=False
+                             , discard=["outlier_boxes", "hmg_boxes", "hmg_imgs"])
             if len(coco) == 2:
                 for i, dataset_type in enumerate(["train", "valid"]):
                     copy_data(coco[i], img_data, f"{dataset_name}_{dataset_type}")
