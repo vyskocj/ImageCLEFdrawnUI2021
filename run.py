@@ -412,12 +412,12 @@ def get_cfg_local(model_name, dataset_name, base_lr, batch_size, acum_batch_size
     # output path
     suffix = "" if (output_dir_suffix is None or output_dir_suffix == "") else f"_{output_dir_suffix}"
     prefix = "" if (output_dir_prefix is None or output_dir_prefix == "") else f"{output_dir_prefix}_"
-    color_depth = "greyscale" if greyscale is True else ret_cfg.INPUT.FORMAT
+    color_space = "greyscale" if greyscale is True else ret_cfg.INPUT.FORMAT
     if output_dir_main == "":
-        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], dataset_name, color_depth,
+        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], dataset_name, color_space,
                                           f"{prefix}{model_name}{suffix}")
     else:
-        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], output_dir_main, color_depth,
+        ret_cfg.OUTPUT_DIR = os.path.join(CONFIG["output_path"], output_dir_main, color_space,
                                           f"{prefix}{model_name}{suffix}")
     # check if output path exists
     output_orig = ret_cfg.OUTPUT_DIR

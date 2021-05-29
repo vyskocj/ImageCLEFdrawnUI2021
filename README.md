@@ -39,7 +39,7 @@ in the following format:
 ### Configuration
 The basic configuration for both Screenshot and Wireframe tasks can be adjusted in the "CONFIG" dictionary of the [run.py](./run.py).
 
-The default configuration is consistent with the final settings that have been used for comparison of different architectures in our approach of the challenge (see working notes, chapter 2.2 Detection Networks comparison).
+The default configuration is consistent with the final settings that have been used for comparison of different architectures in our approach of the challenge (see [our working notes](https://scholar.google.com/scholar?hl=cs&as_sdt=0%2C5&q=Improving+web+user+interface+element+detection+using+Faster+R-CNN&btnG=), chapter 4 Backbones comparison).
 Additional used configuration is summarized in the following tables *(SS - Screenshot task, WF - Wireframe task)*:
 
 | Character | Explanation                                                                                                    |
@@ -47,7 +47,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
 | "empty"   | not used / not relevant                                                                                        |
 | ✓         | used / relevant                                                                                                |
 | ~         | modified, see the <a href="#addit_configs">Additional configurations</a> for specific parameters of the CONFIG |
-| default   | specific for Anchor generator, see the <a href="#exp5">Aspect ratios / Anchor generator</a>                    |
+| default   | specific for Anchor generator, see the <a href="#exp5">Anchor box proposals</a>                                |
 
 <table>
 <thead>
@@ -72,7 +72,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
 </thead>
 <tbody>
   <tr>
-    <td><a href="#exp1">Cleaning noisy data</a></td>
+    <td><a href="#exp1">Filtering noisy data</a></td>
     <td>✓</td>
     <td></td>
     <td><a href="#exp1">~</a></td>
@@ -84,7 +84,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
     <td>default</td>
   </tr>
   <tr>
-    <td><a href="#exp2">Random image resize</a></td>
+    <td><a href="#exp2">Image resize</a></td>
     <td>✓</td>
     <td>✓</td>
     <td>✓</td>
@@ -108,7 +108,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
     <td>default</td>
   </tr>
   <tr>
-    <td><a href="#exp4">Greyscale images</a></td>
+    <td><a href="#exp4">Color space</a></td>
     <td>✓</td>
     <td>✓</td>
     <td>✓</td>
@@ -120,7 +120,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
     <td>default</td>
   </tr>
   <tr>
-    <td><a href="#exp5">Aspect ratios</a></td>
+    <td><a href="#exp5">Anchor box proposals</a></td>
     <td>✓</td>
     <td>✓</td>
     <td>✓</td>
@@ -136,7 +136,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
 
 #### <span id="addit_configs">Additional configurations</span>
 <details>
-<summary id="exp1">Cleaning noisy data</summary>
+<summary id="exp1">Filtering noisy data</summary>
 
 | Subexperiment                     | discard_data              | threshold_box |
 | :-------------------------------- | :------------------------ | :------------ |
@@ -150,7 +150,7 @@ Additional used configuration is summarized in the following tables *(SS - Scree
 </details>
 
 <details>
-<summary id="exp2">Random image resize</summary>
+<summary id="exp2">Image resize</summary>
 
 | Subexperiment             | relative_resize_with_crop | resize_ratio | resize_ratio_delta |
 | :------------------------ | :------------------------ | :----------- | :----------------- |
@@ -173,14 +173,14 @@ Additional used configuration is summarized in the following tables *(SS - Scree
 </details>
 
 <details>
-<summary id="exp4">Greyscale images</summary>
+<summary id="exp4">Color space</summary>
 
 No additional specification of the "CONFIG" dictionary is needed,
 just use the argument [-G, --greyscale] for running the script when you want to convert images into greyscale (see section <a href="#training">Training</a>).
 </details>
 
 <details>
-<summary id="exp5">Aspect ratios / Anchor generator</summary>
+<summary id="exp5">Anchor box proposals</summary>
 
 | Subexperiment                  | aspect_ratios        | anchor_sizes                      |
 | :----------------------------- | :------------------- | :-------------------------------- |
@@ -274,7 +274,7 @@ python run.py --train -b <batch_size> -a <accum_grad> -lr <learning_rate> -e <ep
   <tr>
     <td>[-P, --predict]</td>
     <td></td>
-    <td>Show predictions of the model, use this with argument --train and -LP</td>
+    <td>Show predictions of the model, use this with argument [-T, --train] and [-LP, --lim_predict]</td>
   </tr>
   <tr>
     <td>[-LP, --lim_predict]</td>
@@ -294,7 +294,7 @@ python run.py --train -b <batch_size> -a <accum_grad> -lr <learning_rate> -e <ep
   <tr>
     <td>[-pre, --prefix]</td>
     <td>&lt;prefix&gt;</td>
-    <td>Prefix specifying the output directory, where all outputs (checkpoint, predictions, submission file, ...) should be stored</td>
+    <td>Prefix specifying the output directory, where all output files (checkpoint, predictions, submission file, ...) should be stored</td>
   </tr>
 </tbody>
 </table>
@@ -306,7 +306,7 @@ using [MetaCentrum](https://metavo.metacentrum.cz/en/index.html) services.
 #### Output directory
 All files are stored in the ./&#95;&#95;OUTPUT&#95;&#95;/ directory. Your models are stored under following format:
 ```
-./__OUTPUT__/model_output/<challenge_task>/<color_depth>/<prefix><model_name_with_arguments>
+./__OUTPUT__/model_output/<challenge_task>/<color_space>/<prefix><model_name_with_arguments>
 ```
 
 Where:
@@ -314,7 +314,7 @@ Where:
 | Definition                    | Description                                                                                                     |
 | :---------------------------- | :-------------------------------------------------------------------------------------------------------------- |
 | \<challenge_task\>            | The task of the challenge, i.e. Screenshot or Wireframe                                                         |
-| \<color_depth\>               | Used color depth, i.e. RGB (default) or greyscale (use [-G, --greyscale] argument)                              |
+| \<color_space\>               | Used color space, i.e. RGB (default) or greyscale (use [-G, --greyscale] argument)                              |
 | \<prefix\>                    | A prefix specifying the output directory, i.e. use [-pre, --prefix] argument                                    |
 | \<model_name_with_arguments\> | Used model ([-m, --model] argument) and additional arguments, such as [-lr, --learning rate], or [-e, --epochs] |
 
@@ -341,3 +341,15 @@ Where the *<model_outputs>* is path to the desired output directory, e.g. the de
 | pwc                | 0.836       | 0.865          |
 | *baseline*         | *0.747*     | *0.763*        |
 | AIMultimediaLab    | 0.216       | 0.319          |
+
+### Citation
+If you use these scripts in your research or wish to refer to our approach, please use the following BibTeX entry.
+
+```BibTeX
+@article{vyskocil2021improving,
+  title  = {Improving web user interface element detection using Faster R-CNN},
+  author = {Vysko{\v{c}}il, Ji{\v{r}}{\'\i} and Picek, Luk{\'a}{\v{s}}},
+  url    = {https://github.com/vyskocj/ImageCLEFdrawnUI2021},
+  year   = {2021}
+}
+```
