@@ -346,10 +346,14 @@ Where the *<model_outputs>* is path to the desired output directory, e.g. the de
 If you use these scripts in your research or wish to refer to our approach, please use the following BibTeX entry.
 
 ```BibTeX
-@article{vyskocil2021improving,
-  title  = {Improving web user interface element detection using Faster R-CNN},
-  author = {Vysko{\v{c}}il, Ji{\v{r}}{\'\i} and Picek, Luk{\'a}{\v{s}}},
-  url    = {https://github.com/vyskocj/ImageCLEFdrawnUI2021},
-  year   = {2021}
+@inproceedings{vyskocil2021improving,
+  title     = {Improving web user interface element detection using Faster R-CNN},
+  author    = {Vysko{\v{c}}il, Ji{\v{r}}{\'\i} and Picek, Luk{\'a}{\v{s}}},
+  year      = {2021},
+  booktitle = {CLEF2021 Working Notes},
+  series    = {{CEUR} Workshop Proceedings},
+  pages     = {1375-1386},
+  month     = {September 21-24},
+  address   = {Bucharest, Romania},
 }
 ```
